@@ -764,7 +764,7 @@ export default function ScannerDashboard() {
                       />
                     </th>
                     <th className="item-column">商品</th>
-                    <th className="numeric">BUFF 求购最高价</th>
+                    <th className="numeric">CSFloat 求购最高价</th>
                     <th className="numeric">BUFF</th>
                     <th className="numeric">悠悠有品</th>
                     <th className="numeric">当日成交量</th>
@@ -950,25 +950,22 @@ function ResultRow({
 }
 
 function BidPriceCell({ item }: { item: ScanResult }) {
-  const bids: Array<{ platform: string; price: number | null }> = [
-    { platform: "BUFF", price: item.buff?.bidPrice ?? null },
-    { platform: "UU", price: item.youpin?.bidPrice ?? null },
-  ];
-  const available = bids.filter((bid) => bid.price != null);
-  const best = available.sort((a, b) => (b.price ?? 0) - (a.price ?? 0))[0] ?? null;
-  if (!best) {
+  // CSFloat listing price = the price a buyer can immediately purchase at (Buy Now).
+  // CSQAQ's batch endpoint does not return BUFF/UU buy-order prices, so the first
+  // column shows the CSFloat offer price (labeled "CSFloat 求购最高价") instead.
+  if (item.csfloatCny == null) {
     return (
       <>
         <b>--</b>
-        <small>无求购价</small>
+        <small>无 CSFloat 报价</small>
       </>
     );
   }
   return (
     <>
-      <b>¥{money(best.price!)}</b>
+      <b>¥{money(item.csfloatCny)}</b>
       <small>
-        {best.platform} 最高求购{available.length > 1 ? ` · 双平台有求购` : ""}
+        ${money(item.csfloatUsd)} · CSFloat
       </small>
     </>
   );

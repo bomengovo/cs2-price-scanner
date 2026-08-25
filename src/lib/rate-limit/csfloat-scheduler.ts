@@ -35,16 +35,9 @@ export async function scheduleCsfloatListings(options: {
   url: string; headers: HeadersInit; signal?: AbortSignal; sessionId: string; page: number; caller: string; probe?: boolean;
 }): Promise<Response> {
   const task = queue.then(async () => {
+    // Cooldown removed: always clear any persisted block so the API is reachable.
+    saveRateState("csfloat", "listings", { blockedUntil: 0 });
     const state = csfloatStatus();
-    if (state.blocked) throw new ProviderApiError("csfloat", "/api/v1/listings", 429, "LOCAL_COOLDOWN", `CSFloat 正在限流冷却，剩余 ${Math.ceil(state.remainingMs / 1000)} 秒`, state.remainingMs);
-    const egress = await ensureCsfloatEgressStable();
-    if (!egress.stable) {
-      const cooldown = csfloatMultiIpCooldownMs();
-      const blockedUntil = Math.max(getRateState("csfloat", "listings").blockedUntil, Date.now() + cooldown);
-      saveRateState("csfloat", "listings", { blockedUntil });
-      saveProviderState("csfloat", { status: "CSFLOAT_IP_CHANGED", lastFailureAt: Date.now(), retryAt: blockedUntil, message: "检测到 CSFloat 出口公网 IP 变化，已暂停请求" });
-      throw new ProviderApiError("csfloat", "/api/v1/listings", 429, "CSFLOAT_IP_CHANGED", "CSFloat 出口 IP 已变化，已暂停请求以避免多 IP 限流。", blockedUntil - Date.now());
-    }
     const wait = Math.max(0, state.lastRequestAt + minIntervalMs() - Date.now());
     if (wait) await abortableDelay(wait, options.signal);
     const startedAt = Date.now();
@@ -55,15 +48,13 @@ export async function scheduleCsfloatListings(options: {
       const retryAfterMs = parseRetryAfter(response.headers.get("retry-after"));
       recordApiUsage(options.sessionId, "csfloat-listings", { status: response.status, durationMs: Date.now() - startedAt, retryAfterMs: retryAfterMs ?? undefined, page: options.page, requestId, caller: options.caller });
       if (response.status === 429) {
+        // Do not enter a long cooldown; log the failure and surface a plain error so the
+        // caller can decide whether to fall back to a snapshot.
         const rejected = await logRejectedResponse(requestId, options, response);
         const multiIp = isCsfloatMultiIp429(rejected.body);
         noteCsfloatHttpResult(response, retryAfterMs ?? null, multiIp ? "too_many_requests_from_too_many_ips" : "rate_limited");
-        const previous = getProviderState("csfloat");
-        const failures = Math.min(previous.consecutiveFailures + 1, BACKOFF_MS.length);
-        const block = multiIp ? csfloatMultiIpCooldownMs() : retryAfterMs ?? BACKOFF_MS[failures - 1];
-        saveRateState("csfloat", "listings", { blockedUntil: Date.now() + block });
-        saveProviderState("csfloat", { status: multiIp ? "CSFLOAT_MULTI_IP_BLOCKED" : "CSFLOAT_RATE_LIMITED", lastFailureAt: Date.now(), retryAt: Date.now() + block, consecutiveFailures: failures, message: multiIp ? `检测到多 IP 429，进入 ${Math.ceil(block / 60000)} 分钟冷却` : `HTTP 429，冷却 ${Math.ceil(block / 1000)} 秒` });
-        throw new ProviderApiError("csfloat", "/api/v1/listings", 429, multiIp ? "CSFLOAT_MULTI_IP_BLOCKED" : "CSFLOAT_RATE_LIMIT", multiIp ? `CSFloat 检测到多公网 IP 请求，已进入 ${Math.ceil(block / 60000)} 分钟冷却。` : `CSFloat 返回 429，已进入 ${Math.ceil(block / 1000)} 秒冷却，本次没有继续重试。`, block);
+        saveProviderState("csfloat", { status: multiIp ? "CSFLOAT_MULTI_IP_BLOCKED" : "CSFLOAT_RATE_LIMITED", lastFailureAt: Date.now(), consecutiveFailures: getProviderState("csfloat").consecutiveFailures + 1, message: multiIp ? `检测到多 IP 429` : `HTTP 429` });
+        throw new ProviderApiError("csfloat", "/api/v1/listings", 429, multiIp ? "CSFLOAT_MULTI_IP_BLOCKED" : "CSFLOAT_RATE_LIMIT", multiIp ? `CSFloat 检测到多公网 IP 请求。` : `CSFloat 返回 429。`, null);
       }
       if (response.status === 401 || response.status === 403) { await logRejectedResponse(requestId, options, response); noteCsfloatHttpResult(response, retryAfterMs ?? null, "auth_error"); saveProviderState("csfloat", { status: "CSFLOAT_UNAVAILABLE", lastFailureAt: Date.now(), consecutiveFailures: getProviderState("csfloat").consecutiveFailures + 1, message: `HTTP ${response.status}` }); throw new ProviderApiError("csfloat", "/api/v1/listings", response.status, "CSFLOAT_AUTH_ERROR", "CSFloat API认证失败。", null); }
       if (!response.ok) { await logRejectedResponse(requestId, options, response); noteCsfloatHttpResult(response, retryAfterMs ?? null, "server_error"); saveProviderState("csfloat", { status: "CSFLOAT_UNAVAILABLE", lastFailureAt: Date.now(), consecutiveFailures: getProviderState("csfloat").consecutiveFailures + 1, message: `HTTP ${response.status}` }); throw new ProviderApiError("csfloat", "/api/v1/listings", response.status, "CSFLOAT_SERVER_ERROR", `CSFloat 请求失败（HTTP ${response.status}）。`, null); }

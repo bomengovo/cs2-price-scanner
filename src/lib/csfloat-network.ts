@@ -60,7 +60,8 @@ export function csfloatMultiIpCooldownMs(): number {
 }
 
 export function shouldPauseCsfloatOnIpChange(): boolean {
-  return process.env.CSFLOAT_PAUSE_ON_IP_CHANGE !== "false";
+  // Cooldown removed per user request: never pause CSFloat on an IP change so the API stays reachable.
+  return false;
 }
 
 export async function csfloatFetch(url: string, init: RequestInit): Promise<Response> {

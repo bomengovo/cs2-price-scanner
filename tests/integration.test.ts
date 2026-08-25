@@ -20,7 +20,7 @@ import { csfloatNeedsProbe, csfloatStatus } from "../src/lib/rate-limit/csfloat-
 import { chunkMarketHashNames, domesticDataToPrices, getCSQAQDailyVolume, getCSQAQItemMetadata, getCSQAQMarketData, normalizeCSQAQItem } from "../src/lib/csqaq";
 import { scheduleCsqaqBatch } from "../src/lib/rate-limit/csqaq-scheduler";
 import { withCsqaqAuthRecovery } from "../src/lib/csqaq-ip-binding";
-import { getCsfloatNetworkDiagnostics, pauseCsfloatForIpChange, refreshCsfloatNetworkDiagnostics, resetCsfloatNetworkDiagnosticsForTest } from "../src/lib/csfloat-network";
+import { ensureCsfloatEgressStable, getCsfloatNetworkDiagnostics, pauseCsfloatForIpChange, refreshCsfloatNetworkDiagnostics, resetCsfloatNetworkDiagnosticsForTest } from "../src/lib/csfloat-network";
 
 const dbPath = `D:/Codex/Temp/cs2-price-scanner-test-${process.pid}.db`;
 let mockResults: ScanResult[] = [];
@@ -480,17 +480,20 @@ describe("provider scheduling and cache integrity", () => {
     resetCsfloatNetworkDiagnosticsForTest({ startupPublicIp: "203.0.113.10", currentPublicIp: "203.0.113.10", checkedAt: Date.now() });
     const fetchMock = vi.fn().mockResolvedValue(new Response("{}", { status: 429, headers: { "retry-after": "2" } }));
     vi.stubGlobal("fetch", fetchMock);
+    // Cooldown removed: a 429 surfaces the error but does NOT enter a persistent block.
     await expect(scheduleCsfloatListings({ url: "https://example.test/listings", headers: {}, sessionId: "rate-test", page: 1, caller: "test" }))
       .rejects.toEqual(expect.objectContaining<Partial<ProviderApiError>>({ httpStatus: 429, errorCode: "CSFLOAT_RATE_LIMIT" }));
-    expect(getRateState("csfloat", "listings").blockedUntil).toBeGreaterThan(Date.now());
+    expect(getProviderState("csfloat").status).toBe("CSFLOAT_RATE_LIMITED");
+    // The next request is not blocked by a cooldown; it reaches the network again.
     await expect(scheduleCsfloatListings({ url: "https://example.test/listings", headers: {}, sessionId: "rate-test", page: 1, caller: "test" }))
-      .rejects.toEqual(expect.objectContaining<Partial<ProviderApiError>>({ errorCode: "LOCAL_COOLDOWN" }));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+      .rejects.toEqual(expect.objectContaining<Partial<ProviderApiError>>({ httpStatus: 429, errorCode: "CSFLOAT_RATE_LIMIT" }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     saveRateState("csfloat", "listings", { blockedUntil: 0 });
+    saveProviderState("csfloat", { status: "CSFLOAT_LIVE", consecutiveFailures: 0, retryAt: null, message: null });
     vi.unstubAllGlobals();
   });
 
-  it("classifies the multi-IP 429 into a long global cooldown without retrying", async () => {
+  it("classifies the multi-IP 429 without entering a long cooldown", async () => {
     saveRateState("csfloat", "listings", { lastRequestAt: 0, blockedUntil: 0 });
     saveProviderState("csfloat", { status: "CSFLOAT_LIVE", consecutiveFailures: 0, retryAt: null, message: null });
     resetCsfloatNetworkDiagnosticsForTest({ startupPublicIp: "203.0.113.10", currentPublicIp: "203.0.113.10", checkedAt: Date.now() });
@@ -499,25 +502,28 @@ describe("provider scheduling and cache integrity", () => {
     await expect(scheduleCsfloatListings({ url: "https://example.test/listings", headers: {}, sessionId: "multi-ip-test", page: 1, caller: "test" }))
       .rejects.toEqual(expect.objectContaining<Partial<ProviderApiError>>({ errorCode: "CSFLOAT_MULTI_IP_BLOCKED" }));
     expect(getProviderState("csfloat").status).toBe("CSFLOAT_MULTI_IP_BLOCKED");
-    expect(getRateState("csfloat", "listings").blockedUntil).toBeGreaterThanOrEqual(Date.now() + 1_700_000);
+    // No long global cooldown: the next request reaches the network again.
     await expect(scheduleCsfloatListings({ url: "https://example.test/listings", headers: {}, sessionId: "multi-ip-test", page: 1, caller: "test" }))
-      .rejects.toEqual(expect.objectContaining<Partial<ProviderApiError>>({ errorCode: "LOCAL_COOLDOWN" }));
-    expect(fetchMock).toHaveBeenCalledTimes(1);
+      .rejects.toEqual(expect.objectContaining<Partial<ProviderApiError>>({ errorCode: "CSFLOAT_MULTI_IP_BLOCKED" }));
+    expect(fetchMock).toHaveBeenCalledTimes(2);
     saveRateState("csfloat", "listings", { blockedUntil: 0 });
     saveProviderState("csfloat", { status: "CSFLOAT_LIVE", consecutiveFailures: 0, retryAt: null, message: null });
     vi.unstubAllGlobals();
   });
 
-  it("pauses CSFloat before networking when the observed public IP changes", async () => {
+  it("does not pause CSFloat when the observed public IP changes", async () => {
     saveRateState("csfloat", "listings", { lastRequestAt: 0, blockedUntil: 0 });
     saveProviderState("csfloat", { status: "CSFLOAT_LIVE", consecutiveFailures: 0, retryAt: null, message: null });
     resetCsfloatNetworkDiagnosticsForTest({ startupPublicIp: "203.0.113.10", currentPublicIp: "203.0.113.11", checkedAt: Date.now(), ipChanged: true });
-    const fetchMock = vi.fn();
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ data: [rawListing(1)] }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
-    await expect(scheduleCsfloatListings({ url: "https://example.test/listings", headers: {}, sessionId: "ip-change-test", page: 1, caller: "test" }))
-      .rejects.toEqual(expect.objectContaining<Partial<ProviderApiError>>({ errorCode: "CSFLOAT_IP_CHANGED" }));
-    expect(getProviderState("csfloat").status).toBe("CSFLOAT_IP_CHANGED");
-    expect(fetchMock).not.toHaveBeenCalled();
+    // IP change detection still runs, but it no longer blocks the request.
+    const egress = await ensureCsfloatEgressStable();
+    expect(egress.stable).toBe(true);
+    const listings = await fetchCSFloatListings({ limit: 1, maxSafePages: 1, apiKey: "ip-key", sessionId: "ip-change-test" });
+    expect(listings.length).toBeGreaterThan(0);
+    expect(getProviderState("csfloat").status).toBe("CSFLOAT_LIVE");
+    expect(fetchMock).toHaveBeenCalled();
     saveRateState("csfloat", "listings", { blockedUntil: 0 });
     saveProviderState("csfloat", { status: "CSFLOAT_LIVE", consecutiveFailures: 0, retryAt: null, message: null });
     vi.unstubAllGlobals();
@@ -556,7 +562,7 @@ describe("provider scheduling and cache integrity", () => {
     vi.unstubAllGlobals();
   });
 
-  it("background IP refresh persists a pause when the public IP changes", async () => {
+  it("background IP refresh detects a change but does not pause when cooldown is disabled", async () => {
     saveRateState("csfloat", "listings", { lastRequestAt: 0, blockedUntil: 0 });
     saveProviderState("csfloat", { status: "CSFLOAT_LIVE", consecutiveFailures: 0, retryAt: null, message: null });
     resetCsfloatNetworkDiagnosticsForTest({ startupPublicIp: "203.0.113.10", currentPublicIp: "203.0.113.10", checkedAt: Date.now() - 70_000 });
@@ -565,8 +571,9 @@ describe("provider scheduling and cache integrity", () => {
     const diagnostics = await refreshCsfloatNetworkDiagnostics(false);
     expect(diagnostics.ipChanged).toBe(true);
     expect(diagnostics.currentPublicIp).toBe("203.0.113.77");
-    expect(getProviderState("csfloat").status).toBe("CSFLOAT_IP_CHANGED");
-    expect(getRateState("csfloat", "listings").blockedUntil).toBeGreaterThan(Date.now());
+    // No cooldown: the provider stays LIVE and no pause is persisted.
+    expect(getProviderState("csfloat").status).toBe("CSFLOAT_LIVE");
+    expect(getRateState("csfloat", "listings").blockedUntil).toBe(0);
     saveRateState("csfloat", "listings", { blockedUntil: 0 });
     saveProviderState("csfloat", { status: "CSFLOAT_LIVE", consecutiveFailures: 0, retryAt: null, message: null });
     vi.unstubAllGlobals();

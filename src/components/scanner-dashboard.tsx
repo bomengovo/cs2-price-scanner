@@ -764,7 +764,7 @@ export default function ScannerDashboard() {
                       />
                     </th>
                     <th className="item-column">商品</th>
-                    <th className="numeric">CSFloat 求购最高价</th>
+                    <th className="numeric">CSFloat 在售最低价</th>
                     <th className="numeric">BUFF</th>
                     <th className="numeric">悠悠有品</th>
                     <th className="numeric">当日成交量</th>
@@ -950,9 +950,9 @@ function ResultRow({
 }
 
 function BidPriceCell({ item }: { item: ScanResult }) {
-  // CSFloat listing price = the price a buyer can immediately purchase at (Buy Now).
-  // CSQAQ's batch endpoint does not return BUFF/UU buy-order prices, so the first
-  // column shows the CSFloat offer price (labeled "CSFloat 求购最高价") instead.
+  // CSFloat listing price = the price a buyer can immediately purchase at (Buy Now),
+  // i.e. the lowest in-stock sell price. CSFloat's public API does not expose buy
+  // orders, so the first column shows the real-time lowest sell price.
   if (item.csfloatCny == null) {
     return (
       <>
@@ -965,7 +965,7 @@ function BidPriceCell({ item }: { item: ScanResult }) {
     <>
       <b>¥{money(item.csfloatCny)}</b>
       <small>
-        ${money(item.csfloatUsd)} · CSFloat
+        ${money(item.csfloatUsd)} · CSFloat 在售
       </small>
     </>
   );

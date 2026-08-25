@@ -7,7 +7,50 @@ import { csfloatNeedsProbe, scheduleCsfloatListings } from "./rate-limit/csfloat
 import fs from "node:fs";
 import path from "node:path";
 
-type RawListing = Record<string, unknown> & { item?: Record<string, unknown> };
+type RawListing = Record<string, unknown> & { item?: Record<string, unknown> };/**
+ * Fetches the REAL-TIME lowest buy-now (in-stock sell) price for a single item
+ * by its market_hash_name. CSFloat's public API does not expose buy orders, so
+ * this returns the lowest in-stock sell price ("Buy Now"), in USD cents.
+ *
+ * Goes through the global CSFloat scheduler + fixed proxy. Returns null when the
+ * item has no live buy-now listings or the request fails.
+ */
+export async function getCSFloatLowestSellPrice(options: {
+  marketHashName: string;
+  apiKey?: string;
+  signal?: AbortSignal;
+  sessionId?: string;
+}): Promise<{ priceUsdCents: number; listingId: string } | null> {
+  const key = options.apiKey?.trim() || getServerSecret("CSFLOAT_API_KEY");
+  const useAuth = process.env.CSFLOAT_LISTINGS_AUTH_REQUIRED === "true";
+  const url = new URL("https://csfloat.com/api/v1/listings");
+  url.searchParams.set("limit", "50");
+  url.searchParams.set("type", "buy_now");
+  url.searchParams.set("market_hash_name", options.marketHashName);
+  let response: Response;
+  if (csfloatNeedsProbe()) {
+    // A short probe first: when a prior 429 ended but recovery was unverified,
+    // send one minimal request before the real query.
+    const probeUrl = new URL("https://csfloat.com/api/v1/listings");
+    probeUrl.searchParams.set("limit", "1");
+    probeUrl.searchParams.set("type", "buy_now");
+    const probe = await scheduleCsfloatListings({ url: probeUrl.toString(), headers: getCsfloatListingHeaders(useAuth ? key : undefined), signal: options.signal, sessionId: options.sessionId ?? "untracked", page: 0, caller: "csfloat-live-probe", probe: true });
+    if (!probe.ok) throw new ApiError("CSFloat 恢复验证失败", probe.status);
+    await probe.body?.cancel().catch(() => undefined);
+  }
+  response = await scheduleCsfloatListings({ url: url.toString(), headers: getCsfloatListingHeaders(useAuth ? key : undefined), signal: options.signal, sessionId: options.sessionId ?? "untracked", page: 1, caller: "getCSFloatLowestSellPrice" });
+  const body = await response.json() as unknown;
+  const rawList = Array.isArray(body) ? body : Array.isArray((body as { data?: unknown }).data) ? (body as { data: RawListing[] }).data : [];
+  let best: { price: number; id: string } | null = null;
+  for (const raw of rawList as RawListing[]) {
+    const price = Number(raw.price);
+    const id = String(raw.id ?? "");
+    if (!Number.isFinite(price) || price <= 0 || !id) continue;
+    if (!best || price < best.price) best = { price, id };
+  }
+  if (!best) return null;
+  return { priceUsdCents: best.price, listingId: best.id };
+}
 
 export function normalizeCSFloatListing(raw: RawListing): CSFloatListing | null {
   const item = raw.item ?? {};

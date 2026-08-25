@@ -1,12 +1,13 @@
 import { environmentSettings } from "./config";
 import { fetchCSFloatListings } from "./csfloat";
-import { getBaseItem, getCsqaqItemMetadata, getLastScan, getLatestCsfloatSnapshot, getStoredSettings, saveCsfloatSnapshot, saveScanResults, saveScanSessionMetrics } from "./db";
+import { getBaseItem, getCachedDailyVolumes, getCsqaqItemMetadata, getLastScan, getLatestCsfloatSnapshot, getStoredSettings, saveCsfloatSnapshot, saveScanResults, saveScanSessionMetrics } from "./db";
 import { buildItemImageCandidates, categorizeItem } from "./items";
 import { mockChineseNames, mockListings, mockPrices } from "./mock";
 import { getBuffUrl, getCsfloatUrl, getYoupinUrl, validatePlatformLinks } from "./platform-links";
 import { calculateComparison, centsToUsd, usdToCny } from "./pricing";
 import { getSteamDTPrices } from "./steamdt";
-import { domesticDataToPrices, getCSQAQMarketData } from "./csqaq";
+import { domesticDataToPrices, getCSQAQDailyVolume, getCSQAQMarketData } from "./csqaq";
+import { getShanghaiDayRange } from "./volume/types";
 import { flushApiUsage } from "./rate-limit/api-usage";
 import type { AppSettings, CSFloatListing, PlatformPrice, ScanProgress, ScanRequest, ScanResult, ScanSessionState } from "./types";
 import fs from "node:fs";
@@ -105,6 +106,26 @@ async function runScanSession(request: ScanRequest, onProgress: (progress: ScanP
       } catch (error) { warnings.push(error instanceof Error ? error.message : "SteamDT 价格获取失败"); prices = new Map(); }
     }
   }
+  // Auto-fill daily volume from CSQAQ chart API for all unique items (non-blocking)
+  const csqaqToken = getServerSecret("CSQAQ_API_TOKEN");
+  if (!settings.mockMode && csqaqToken) {
+    progress.status = "正在获取当日成交量";
+    onProgress({ ...progress });
+    const volumePromises = names.flatMap((name) => {
+      const metadata = getCsqaqItemMetadata(name);
+      const gid = metadata?.csqaqGoodId ?? null;
+      if (!gid || gid <= 0) return [];
+      return [("buff" as const), ("youpin" as const)].map((platform) =>
+        getCSQAQDailyVolume({ marketHashName: name, goodId: gid, platform, apiToken: csqaqToken, signal, sessionId: scanSessionId }).catch(() => null),
+      );
+    });
+    // Process in batches to avoid overwhelming the API
+    const batchSize = 5;
+    for (let i = 0; i < volumePromises.length; i += batchSize) {
+      if (signal?.aborted) break;
+      await Promise.allSettled(volumePromises.slice(i, i + batchSize));
+    }
+  }
   progress.matchedItems = [...prices.values()].filter((value) => value.length > 0).length;
   domestic.matched = progress.matchedItems;
   logScanStage(scanSessionId, domestic.provider === "csqaq" ? "CSQAQ_MATCHED" : "STEAMDT_MATCHED", { requestedNames: names.length, matchedNames: progress.matchedItems });
@@ -169,6 +190,16 @@ function toScanResult(listing: CSFloatListing, platformPrices: import("./types")
   if (youpin && !youpinTemplateId) logIntegrity("PLATFORM_ID_MISSING", listing.marketHashName, youpin.rawPlatform, youpin.platformItemId);
   const usd = centsToUsd(listing.price);
   const imageUrls = buildItemImageCandidates(...(listing.imageUrls ?? []), listing.iconUrl, base?.imageUrl);
+  // Check daily_volume_cache for chart data (populated by the enrichment flow)
+  const volumeDate = getShanghaiDayRange().date;
+  const volumeCache = getCachedDailyVolumes([listing.marketHashName], volumeDate, 86_400_000);
+  const buffVolume = volumeCache.get(`${listing.marketHashName}:buff`)?.volume ?? null;
+  const uuVolume = volumeCache.get(`${listing.marketHashName}:youpin`)?.volume ?? null;
+  const buffVolumeSource = volumeCache.get(`${listing.marketHashName}:buff`)?.source ?? null;
+  const uuVolumeSource = volumeCache.get(`${listing.marketHashName}:youpin`)?.source ?? null;
+  const hasChartVolume = buffVolumeSource?.startsWith("csqaq-chart") || uuVolumeSource?.startsWith("csqaq-chart");
+  const totalDailyVolume = buffVolume != null && uuVolume != null ? buffVolume + uuVolume : (buffVolume ?? uuVolume ?? null);
+  const volumeCoverage = hasChartVolume ? (buffVolume != null && uuVolume != null ? "complete" : "partial") : "none";
   return calculateComparison({
     ...listing,
     listingUrl: getCsfloatUrl(csfloatListingId, listing.marketHashName)!,
@@ -190,10 +221,10 @@ function toScanResult(listing: CSFloatListing, platformPrices: import("./types")
     csqaqVolumeFetchedAt: metadata?.fetchedAt ?? null,
     csqaqVolumeSource: metadata?.fetchedAt ? "csqaq-info-good" : null,
     csfloatDailyVolume: null,
-    buffDailyVolume: null,
-    uuDailyVolume: null,
-    totalDailyVolume: null,
-    volumeCoverage: "none",
+    buffDailyVolume: buffVolume,
+    uuDailyVolume: uuVolume,
+    totalDailyVolume,
+    volumeCoverage,
     buffUrl: getBuffUrl(buffGoodsId, listing.marketHashName),
     youpinUrl: getYoupinUrl(youpinTemplateId, listing.marketHashName),
     dataUpdatedAt: Math.max(buff?.updatedAt ?? 0, youpin?.updatedAt ?? 0, Date.now()),

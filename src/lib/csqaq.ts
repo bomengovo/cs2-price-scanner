@@ -6,10 +6,11 @@ import { recordApiUsage } from "./rate-limit/api-usage";
 import { scheduleCsqaqBatch, scheduleCsqaqRequest } from "./rate-limit/csqaq-scheduler";
 import { assertCsqaqAuthAvailable, withCsqaqAuthRecovery } from "./csqaq-ip-binding";
 import type { CsqaqItemMetadata, DomesticMarketData, PlatformPrice } from "./types";
-import { unavailableVolume, type DailyVolumeResult } from "./volume/types";
+import { unavailableVolume, getShanghaiDayRange, type DailyVolumeResult } from "./volume/types";
 
 const endpoint = "https://api.csqaq.com/api/v1/goods/getPriceByMarketHashName";
 const detailEndpoint = "https://api.csqaq.com/api/v1/info/good";
+const chartEndpoint = "https://api.csqaq.com/api/v1/info/chart";
 export const CSQAQ_METADATA_TTL_MS = 6 * 60 * 60 * 1000;
 
 export async function getCSQAQMarketData(options: { marketHashNames: string[]; apiToken: string; cacheMinutes: number; forceRefresh?: boolean; signal?: AbortSignal; sessionId?: string }): Promise<{ data: Map<string, DomesticMarketData>; batchRequests: number; matched: number }> {
@@ -89,14 +90,54 @@ export function isCsqaqMetadataFresh(metadata: CsqaqItemMetadata | null | undefi
 }
 
 /**
- * Kept solely for the legacy /api/volumes route while Stage A moves the UI to
- * the verified item-level endpoint. It intentionally never calls /info/chart.
+ * Fetch the real daily volume from CSQAQ /info/chart.
+ *
+ * Returns the most recent day's turnover_number for the given item and
+ * platform (1 = BUFF, 2 = 悠悠有品).  Uses a 30-day window and takes the
+ * last element of the returned daily time-series.
  */
 export async function getCSQAQDailyVolume(options: {
   marketHashName: string; goodId: number; platform: "buff" | "youpin";
   apiToken?: string; signal?: AbortSignal; sessionId?: string;
 }): Promise<DailyVolumeResult> {
-  return { ...unavailableVolume(options.marketHashName, options.platform, "csqaq-platform-volume-unavailable"), goodId: options.goodId, status: "unavailable" };
+  const chartPlatform = options.platform === "buff" ? 1 : 2;
+  const startedAt = Date.now();
+  const response = await scheduleCsqaqRequest({
+    key: `${options.goodId}:chart:${chartPlatform}`,
+    kind: "CSQAQ_INFO_CHART",
+    priority: "low",
+    signal: options.signal,
+    run: () => withCsqaqAuthRecovery(() => fetchWithRetry(chartEndpoint, {
+      method: "POST",
+      headers: getCsqaqHeaders(options.apiToken),
+      body: JSON.stringify({
+        good_id: String(options.goodId),
+        key: "turnover_number",
+        platform: chartPlatform,
+        period: "30",
+        style: "all_style",
+      }),
+    }, { signal: options.signal, retries: 0, timeoutMs: 20_000 })),
+  });
+  if (options.sessionId) recordApiUsage(options.sessionId, "csqaq-chart", { status: response.status, durationMs: Date.now() - startedAt });
+  const body = await response.json() as { code?: number; data?: { timestamp?: number[]; num_data?: number[] } };
+  if (body.code !== 200 || !body.data?.timestamp?.length || !body.data?.num_data?.length) {
+    return { ...unavailableVolume(options.marketHashName, options.platform, "csqaq-chart-empty"), goodId: options.goodId, status: "unavailable" };
+  }
+  const lastIndex = body.data.timestamp.length - 1;
+  const lastTimestamp = body.data.timestamp[lastIndex]!;
+  const lastVolume = body.data.num_data[lastIndex];
+  const chartDate = new Date(lastTimestamp * 1000).toISOString().split("T")[0]!;
+  return {
+    marketHashName: options.marketHashName,
+    platform: options.platform,
+    goodId: options.goodId,
+    volume: lastVolume ?? null,
+    date: getShanghaiDayRange().date,
+    source: `csqaq-chart:${chartDate}`,
+    fetchedAt: Date.now(),
+    status: "live",
+  };
 }
 
 export function domesticDataToPrices(data: Map<string, DomesticMarketData>): Map<string, PlatformPrice[]> {

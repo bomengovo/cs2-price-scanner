@@ -8,7 +8,7 @@ const DEFAULT_INTERVAL_MS = 1_100;
 const DEFAULT_BLOCK_MS = 60_000;
 
 export type CsqaqPriority = "high" | "medium" | "low";
-export type CsqaqRequestKind = "CSQAQ_PRICE_BATCH" | "CSQAQ_INFO_GOOD";
+export type CsqaqRequestKind = "CSQAQ_PRICE_BATCH" | "CSQAQ_INFO_GOOD" | "CSQAQ_INFO_CHART";
 
 type QueueItem = {
   key: string;

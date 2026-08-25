@@ -21,6 +21,8 @@ export function filterAndSortResults(results: ScanResult[], query: ResultQuery):
   const source = query.listingMode === "lowest" ? lowestListings(results) : [...results];
   const search = query.search.trim().toLocaleLowerCase();
   const priceOf = (item: ScanResult) => query.priceSource === "buff" ? item.buff?.sellPrice : query.priceSource === "youpin" ? item.youpin?.sellPrice : item.csfloatCny;
+  // Daily volume prefers the CSQAQ chart (当日) value; falls back to metadata turnover.
+  const dailyVolumeOf = (item: ScanResult) => item.totalDailyVolume ?? item.csqaqDailyVolume;
   const matchesMode = (item: ScanResult) => {
     if (query.comparisonMode === "all") return Boolean(item.buff || item.youpin);
     const buffLow = (item.buffDiff ?? -Infinity) > 0;
@@ -36,7 +38,7 @@ export function filterAndSortResults(results: ScanResult[], query: ResultQuery):
     if (query.minPrice !== undefined && (price == null || price < query.minPrice)) return false;
     if (query.maxPrice !== undefined && (price == null || price > query.maxPrice)) return false;
     if ((query.minDailyVolume ?? 0) > 0) {
-      const volume = item.csqaqDailyVolume;
+      const volume = dailyVolumeOf(item);
       if (volume == null || volume < query.minDailyVolume!) return false;
     }
     return (item.bestDiff ?? -Infinity) >= query.minDiff && (item.bestDiffPercent ?? -Infinity) >= query.minPercent;
@@ -52,8 +54,8 @@ export function filterAndSortResults(results: ScanResult[], query: ResultQuery):
       case "uuAsc": return asc(a.youpin?.sellPrice) - asc(b.youpin?.sellPrice);
       case "uuDesc": return desc(b.youpin?.sellPrice) - desc(a.youpin?.sellPrice);
       case "diffDesc": return desc(b.bestDiff) - desc(a.bestDiff);
-      case "csqaqVolumeDesc": return desc(b.csqaqDailyVolume) - desc(a.csqaqDailyVolume);
-      case "csqaqVolumeAsc": return asc(a.csqaqDailyVolume) - asc(b.csqaqDailyVolume);
+      case "csqaqVolumeDesc": return desc(dailyVolumeOf(b)) - desc(dailyVolumeOf(a));
+      case "csqaqVolumeAsc": return asc(dailyVolumeOf(a)) - asc(dailyVolumeOf(b));
       case "floatAsc": return asc(a.floatValue) - asc(b.floatValue);
       case "firstSeenDesc": return desc(b.firstSeenAt) - desc(a.firstSeenAt);
       case "updatedDesc": return desc(b.lastPriceUpdateAt ?? b.dataUpdatedAt) - desc(a.lastPriceUpdateAt ?? a.dataUpdatedAt);

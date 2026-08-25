@@ -2,7 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { ApiError } from "./http";
 import { isCsqaqAuthCircuitOpen } from "./csqaq-ip-binding";
-import { CSQAQ_METADATA_TTL_MS, getCSQAQItemMetadata } from "./csqaq";
+import { CSQAQ_METADATA_TTL_MS, getCSQAQDailyVolume, getCSQAQItemMetadata } from "./csqaq";
 import { getCsqaqItemMetadata, getTurnoverCandidates, getTurnoverDatabaseStats, getTurnoverEnrichmentState, saveTurnoverEnrichmentState, type TurnoverEnrichmentState } from "./db";
 
 type Candidate = { marketHashName: string; csqaqGoodId: number; fetchedAt: number | null };
@@ -43,6 +43,11 @@ async function runEnrichment(): Promise<void> {
       const before = getCsqaqItemMetadata(candidate.marketHashName);
       try {
         const metadata = await getCSQAQItemMetadata({ marketHashName: candidate.marketHashName, goodId: candidate.csqaqGoodId });
+        // Also fetch chart daily volume for both platforms (non-blocking, failures are logged)
+        const chartPromises = [("buff" as const), ("youpin" as const)].map((platform) =>
+          getCSQAQDailyVolume({ marketHashName: candidate.marketHashName, goodId: candidate.csqaqGoodId, platform }).catch(() => null),
+        );
+        const [buffChart, uuChart] = await Promise.all(chartPromises);
         const latest = getTurnoverEnrichmentState();
         const cacheHit = Boolean(before?.fetchedAt && before.fetchedAt >= Date.now() - CSQAQ_METADATA_TTL_MS);
         const volume = metadata?.turnoverNumber ?? null;
@@ -51,7 +56,7 @@ async function runEnrichment(): Promise<void> {
           populated: latest.populated + Number(volume != null), realZero: latest.realZero + Number(volume === 0),
           noData: latest.noData + Number(volume == null), message: `正在补全 ${latest.completed + 1} / ${latest.total}`,
         });
-        appendLog(`event=INFO_GOOD goodId=${candidate.csqaqGoodId} status=success turnover=${volume ?? "null"} periodAt=${metadata?.periodAt ?? "null"} completed=${next.completed}/${next.total}`);
+        appendLog(`event=INFO_GOOD goodId=${candidate.csqaqGoodId} status=success turnover=${volume ?? "null"} periodAt=${metadata?.periodAt ?? "null"} buffChart=${buffChart?.volume ?? "null"} uuChart=${uuChart?.volume ?? "null"} completed=${next.completed}/${next.total}`);
       } catch (error) {
         const latest = getTurnoverEnrichmentState();
         const rateLimited = error instanceof ApiError && error.status === 429;

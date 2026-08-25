@@ -52,19 +52,6 @@ type MergeStats = {
 };
 type ProviderStatus = "csqaq" | "steamdt-fallback" | "steamdt" | "unknown" | "CSQAQ_LIVE" | "CSQAQ_CACHE" | "CSQAQ_AUTH_RECOVERED" | "CSQAQ_AUTH_ERROR" | "CSQAQ_RATE_LIMITED" | "CSQAQ_UNAVAILABLE" | "STEAMDT_FALLBACK" | "STEAMDT" | "CSQAQ" | "CACHE" | "ERROR" | "MOCK";
 type CsfloatRuntime = { status?: string; remainingMs?: number; diagnostics?: { currentPublicIp?: string | null; proxyEnabled?: boolean; lastErrorType?: string | null; lastErrorAt?: number | null } };
-type TurnoverTask = {
-  status: "idle" | "running" | "paused" | "rate_limited" | "auth_error" | "completed" | "failed";
-  total: number;
-  completed: number;
-  populated: number;
-  realZero: number;
-  noData: number;
-  failures: number;
-  cacheHits: number;
-  rateLimited: number;
-  message: string | null;
-  database?: { savedResults: number; goodIdAvailable: number; dailyVolumeAvailable: number; dailyVolumeZero: number; dailyVolumeUnknown: number };
-};
 type StreamEvent = {
   type: string;
   progress?: ScanProgress;
@@ -111,8 +98,6 @@ export default function ScannerDashboard() {
   const [page, setPage] = useState(1);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [deletedCount, setDeletedCount] = useState(0);
-  const [pendingTurnovers, setPendingTurnovers] = useState<Set<string>>(new Set());
-  const [turnoverTask, setTurnoverTask] = useState<TurnoverTask | null>(null);
   const [csfloatBlockedUntil, setCsfloatBlockedUntil] = useState(0);
   const [csfloatRuntime, setCsfloatRuntime] = useState<CsfloatRuntime>({});
   const [clock, setClock] = useState(() => Date.now());
@@ -120,7 +105,6 @@ export default function ScannerDashboard() {
     useState<ProviderStatus>("unknown");
   const [sessionProvider, setSessionProvider] = useState<Partial<ScanSessionState>>({});
   const abortRef = useRef<AbortController | null>(null);
-  const loadedPageKeys = useRef(new Set<string>());
 
   const refreshRateState = useCallback(async () => {
     try {
@@ -312,26 +296,6 @@ export default function ScannerDashboard() {
     await reloadResults();
   }
 
-  async function startTurnoverEnrichment(items: ScanResult[] = []) {
-    const unique = [...new Map(items.slice(0, 50).map((item) => [item.marketHashName, item])).values()];
-    setPendingTurnovers((current) => new Set([
-      ...current,
-      ...unique
-        .filter((item) => item.csqaqGoodId != null && item.csqaqGoodId > 0 && item.csqaqVolumeFetchedAt == null)
-        .map((item) => item.marketHashName),
-    ]));
-    try {
-      const response = await fetch("/api/turnover", {
-        method: "POST", headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ items: unique.map((item) => ({ marketHashName: item.marketHashName, csqaqGoodId: item.csqaqGoodId })) }),
-      });
-      if (!response.ok) throw new Error("日成交量补全任务启动失败");
-      setTurnoverTask(await response.json());
-    } catch {
-      /* Auxiliary enrichment must never affect scanner or page availability. */
-    }
-  }
-
   useEffect(() => {
     const timer = window.setTimeout(() => void reloadResults(), 0);
     return () => window.clearTimeout(timer);
@@ -346,22 +310,6 @@ export default function ScannerDashboard() {
     const timer = window.setInterval(() => setClock(Date.now()), 1000);
     return () => { window.clearTimeout(rateTimer); window.clearInterval(ratePoll); window.clearInterval(timer); };
   }, [refreshRateState]);
-  useEffect(() => {
-    let active = true;
-    const poll = async () => {
-      try {
-        const response = await fetch("/api/turnover", { cache: "no-store" });
-        if (!response.ok || !active) return;
-        const task = await response.json() as TurnoverTask;
-        if (!active) return;
-        setTurnoverTask(task);
-        if (task.status === "running" || task.status === "rate_limited") await reloadResults();
-      } catch { /* Background state is optional UI information. */ }
-    };
-    void poll();
-    const timer = window.setInterval(() => void poll(), 2_500);
-    return () => { active = false; window.clearInterval(timer); };
-  }, [reloadResults]);
 
   const queryBase = useMemo(
     () => ({
@@ -451,25 +399,11 @@ export default function ScannerDashboard() {
     (safePage - 1) * pageSize,
     safePage * pageSize,
   );
-  const pageIdentity = pageResults
-    .slice(0, 50)
-    .map((item) => `${item.marketHashName}:${item.csqaqGoodId ?? ""}`)
-    .join("|");
   const maxDiff = Math.max(
     0,
     ...visibleResults.map((item) => item.bestDiff ?? 0),
   );
   const cooldown = Math.max(0, Math.ceil((csfloatBlockedUntil - clock) / 1000));
-
-  useEffect(() => {
-    const current = pageResults.slice(0, 50);
-    if (!current.length) return;
-    if (loadedPageKeys.current.has(pageIdentity)) return;
-    loadedPageKeys.current.add(pageIdentity);
-    void startTurnoverEnrichment(current);
-    // Current-page identity is intentionally represented by the filter/page dependencies.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [pageIdentity]);
 
   return (
     <main className="app-shell">
@@ -587,9 +521,9 @@ export default function ScannerDashboard() {
           positive
         />
         <StatCard
-          label="成交量数据"
-          value={turnoverTask?.database?.dailyVolumeAvailable ?? results.filter((item) => item.csqaqDailyVolume != null).length}
-          detail={`可查询 ${turnoverTask?.database?.goodIdAvailable ?? results.filter((item) => item.csqaqGoodId != null).length}`}
+          label="当日成交量"
+          value={results.filter((item) => item.totalDailyVolume != null || item.csqaqDailyVolume != null).length}
+          detail="CSQAQ 当日统计数据"
         />
       </section>
       <section className="workbench-stats">
@@ -712,16 +646,6 @@ export default function ScannerDashboard() {
             </button>
           </div>
         </div>
-        <div className="volume-toolbar">
-          <button
-            onClick={() => void startTurnoverEnrichment()}
-            disabled={turnoverTask?.status === "running"}
-          >
-            <RefreshCw size={14} />
-            {turnoverTask?.status === "running" ? `日成交量补全 ${turnoverTask.completed} / ${turnoverTask.total}` : "补全日成交量"}
-          </button>
-          <span>{turnoverTask?.message ?? "CSQAQ 商品级日成交量；不等同于 BUFF 或悠悠平台成交量"}</span>
-        </div>
         <div className="filter-grid">
           <label className="search-field">
             <span>搜索全部已保存商品</span>
@@ -840,12 +764,12 @@ export default function ScannerDashboard() {
                       />
                     </th>
                     <th className="item-column">商品</th>
-                    <th className="numeric">CSFloat 成本</th>
+                    <th className="numeric">BUFF 求购最高价</th>
                     <th className="numeric">BUFF</th>
                     <th className="numeric">悠悠有品</th>
-                    <th className="numeric">日成交量</th>
+                    <th className="numeric">当日成交量</th>
                     <th className="numeric">套利</th>
-                    <th>状态 / 时间</th>
+                    <th>状态/时间（BUFF 更新 · 悠悠更新 · CSFloat 更新）</th>
                     <th className="action-column">操作</th>
                   </tr>
                 </thead>
@@ -854,7 +778,6 @@ export default function ScannerDashboard() {
                     <ResultRow
                       key={item.marketHashName}
                       item={item}
-                      pendingTurnovers={pendingTurnovers}
                       now={clock}
                       selected={selected.has(item.marketHashName)}
                       isNew={Boolean(
@@ -902,7 +825,7 @@ export default function ScannerDashboard() {
         )}
       </section>
       <footer>
-        在售数量与 CSQAQ 日成交量是不同指标；日成交量为商品级数据，不代表 BUFF 或悠悠有品各自成交量。
+        当日成交量为 CSQAQ 当日统计数据；BUFF/悠悠价格为对应平台实时售价，求购最高价为对应平台求购栏最高出价。
       </footer>
     </main>
   );
@@ -910,7 +833,6 @@ export default function ScannerDashboard() {
 
 function ResultRow({
   item,
-  pendingTurnovers,
   now,
   selected,
   isNew,
@@ -918,7 +840,6 @@ function ResultRow({
   onDelete,
 }: {
   item: ScanResult;
-  pendingTurnovers: Set<string>;
   now: number;
   selected: boolean;
   isNew: boolean;
@@ -975,18 +896,7 @@ function ResultRow({
         </div>
       </td>
       <td className="numeric price-primary">
-        <b>¥{money(item.csfloatCny)}</b>
-        <small>
-          ${money(item.csfloatUsd)} · {sourceLabel(item.csfloatSource)}
-        </small>
-        {item.csfloatPriceChange != null && item.csfloatPriceChange !== 0 && (
-          <small
-            className={item.csfloatPriceChange < 0 ? "price-down" : "price-up"}
-          >
-            {item.csfloatPriceChange < 0 ? "↓" : "↑"} ¥
-            {money(Math.abs(item.csfloatPriceChange))}
-          </small>
-        )}
+        <BidPriceCell item={item} />
       </td>
       <MarketCell
         price={item.buff}
@@ -994,7 +904,7 @@ function ResultRow({
       <MarketCell
         price={item.youpin}
       />
-      <TurnoverCell item={item} pending={pendingTurnovers.has(item.marketHashName)} now={now} />
+      <TurnoverCell item={item} now={now} />
       <td className={`numeric diff-cell ${positive ? "positive" : ""}`}>
         <b>
           {item.bestDiff == null
@@ -1009,19 +919,9 @@ function ResultRow({
       </td>
       <td>
         <div className="status-cell">
-          <b>{statusLabel(item)}</b>
           <span>
-            更新于 {relativeTime(item.lastPriceUpdateAt ?? item.dataUpdatedAt)}
+            BUFF {formatDate(item.buff?.updatedAt ?? item.buff?.fetchedAt)} · UU {formatDate(item.youpin?.updatedAt ?? item.youpin?.fetchedAt)} · CSFloat {formatDate(item.csfloatFetchedAt)}
           </span>
-          <small
-            title={`首次发现 ${formatDate(item.firstSeenAt)}；最后扫描到 ${formatDate(item.lastSeenAt)}`}
-          >
-            首次 {formatDate(item.firstSeenAt)}
-            <br />
-            最后 {formatDate(item.lastSeenAt)}
-            <br />
-            CSFloat {formatDate(item.csfloatFetchedAt)} · 国内 {formatDate(Math.max(item.buff?.fetchedAt ?? 0, item.youpin?.fetchedAt ?? 0) || null)}
-          </small>
         </div>
       </td>
       <td className="action-column">
@@ -1049,6 +949,31 @@ function ResultRow({
   );
 }
 
+function BidPriceCell({ item }: { item: ScanResult }) {
+  const bids: Array<{ platform: string; price: number | null }> = [
+    { platform: "BUFF", price: item.buff?.bidPrice ?? null },
+    { platform: "UU", price: item.youpin?.bidPrice ?? null },
+  ];
+  const available = bids.filter((bid) => bid.price != null);
+  const best = available.sort((a, b) => (b.price ?? 0) - (a.price ?? 0))[0] ?? null;
+  if (!best) {
+    return (
+      <>
+        <b>--</b>
+        <small>无求购价</small>
+      </>
+    );
+  }
+  return (
+    <>
+      <b>¥{money(best.price!)}</b>
+      <small>
+        {best.platform} 最高求购{available.length > 1 ? ` · 双平台有求购` : ""}
+      </small>
+    </>
+  );
+}
+
 function MarketCell({
   price,
 }: {
@@ -1065,20 +990,16 @@ function MarketCell({
   );
 }
 
-function TurnoverCell({ item, pending, now }: { item: ScanResult; pending: boolean; now: number }) {
+function TurnoverCell({ item, now }: { item: ScanResult; now: number }) {
+  const volume = item.totalDailyVolume ?? item.csqaqDailyVolume;
+  const volumeSource = item.buffDailyVolume != null || item.uuDailyVolume != null ? "CSQAQ CHART" : item.csqaqVolumeSource === "csqaq-info-good" ? "CSQAQ INFO" : null;
   const fetchedAt = item.csqaqVolumeFetchedAt;
-  const periodTimestamp = item.csqaqVolumePeriodAt ? Date.parse(item.csqaqVolumePeriodAt) : Number.NaN;
-  const stale = Boolean(
-    (fetchedAt && now - fetchedAt > 6 * 60 * 60 * 1000)
-    || (Number.isFinite(periodTimestamp) && now - periodTimestamp > 36 * 60 * 60 * 1000),
-  );
-  const period = item.csqaqVolumePeriodAt ? formatDate(item.csqaqVolumePeriodAt) : "统计日未知";
-  const title = `数据源：CSQAQ\n日成交量：${item.csqaqDailyVolume ?? "--"}\n统计日期：${item.csqaqVolumePeriodAt ?? "--"}\n获取时间：${formatDate(fetchedAt)}`;
+  const stale = Boolean(fetchedAt && now - fetchedAt > 24 * 60 * 60 * 1000);
+  const title = `数据源：CSQAQ 当日成交量\n成交量：${volume ?? "--"}\n获取时间：${formatDate(fetchedAt)}`;
   return (
     <td className="numeric turnover-cell" title={title}>
-      <b>{item.csqaqDailyVolume ?? (pending && !fetchedAt ? "..." : "--")}</b>
-      <small>{!fetchedAt ? (pending ? "正在获取" : "等待补全") : `CSQAQ · ${stale ? "STALE" : "LIVE"}`}</small>
-      {fetchedAt && <small>{period}</small>}
+      <b>{volume ?? "--"}</b>
+      <small>{volume != null ? (volumeSource ? `${volumeSource}${stale ? " · STALE" : ""}` : "CSQAQ") : "无当日数据"}</small>
     </td>
   );
 }
@@ -1232,36 +1153,6 @@ function formatDate(value?: number | string | null): string {
         hour: "2-digit",
         minute: "2-digit",
       });
-}
-function relativeTime(value?: number | string | null): string {
-  if (!value) return "--";
-  const delta = Math.max(0, Date.now() - new Date(value).getTime());
-  if (delta < 60_000) return "刚刚";
-  if (delta < 3_600_000) return `${Math.floor(delta / 60_000)} 分钟前`;
-  if (delta < 86_400_000) return `${Math.floor(delta / 3_600_000)} 小时前`;
-  return formatDate(value);
-}
-function sourceLabel(source?: string, status?: string): string {
-  if (status === "stale") return "STALE";
-  if (source?.includes("cache") || status === "cache") return "CACHE";
-  if (source?.includes("csqaq")) return "CSQAQ LIVE";
-  if (source?.includes("steamdt")) return "STEAMDT FALLBACK";
-  return source?.toUpperCase() ?? "LIVE";
-}
-function statusLabel(item: ScanResult): string {
-  if (item.snapshotStatus === "unavailable") return "UNAVAILABLE";
-  if (
-    item.snapshotStatus === "partial" ||
-    item.buff?.status === "stale" ||
-    item.youpin?.status === "stale"
-  )
-    return "STALE / PARTIAL";
-  if (
-    item.buff?.source?.includes("cache") ||
-    item.youpin?.source?.includes("cache")
-  )
-    return "CACHE";
-  return "LIVE";
 }
 function domesticProviderLabel(provider: ProviderStatus): string {
   if (provider === "csqaq" || provider === "CSQAQ" || provider === "CSQAQ_LIVE") return "CSQAQ · LIVE";

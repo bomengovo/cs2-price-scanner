@@ -287,12 +287,32 @@ describe("CSQAQ 主国内数据源", () => {
     vi.unstubAllGlobals();
   });
 
-  it("旧平台成交量接口不请求 Chart，也不把未知值写成 0", async () => {
-    const fetchMock = vi.fn();
+  it("日成交量接口请求 Chart 并解析当日成交量", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 200, data: {
+      timestamp: [1735603200, 1735689600, 1735776000],
+      num_data: [88, 120, 145],
+      main_data: [100, 100, 100],
+    } }), { status: 200 }));
     vi.stubGlobal("fetch", fetchMock);
     const result = await getCSQAQDailyVolume({ marketHashName: "Galil AR | Rocket Pop (Minimal Wear)", goodId: 1041, platform: "buff", apiToken: "token-test" });
-    expect(result).toMatchObject({ volume: null, status: "unavailable", goodId: 1041, source: "csqaq-platform-volume-unavailable" });
-    expect(fetchMock).not.toHaveBeenCalled();
+    expect(result).toMatchObject({ volume: 145, status: "live", goodId: 1041 });
+    expect(result.source).toMatch(/^csqaq-chart:/);
+    expect(result.date).toMatch(/^\d{4}-\d{2}-\d{2}$/);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("https://api.csqaq.com/api/v1/info/chart");
+    expect((init.headers as Record<string, string>).ApiToken).toBe("token-test");
+    const body = JSON.parse(String(init.body)) as Record<string, unknown>;
+    expect(body).toMatchObject({ good_id: "1041", key: "turnover_number", platform: 1, period: "30", style: "all_style" });
+    vi.unstubAllGlobals();
+  });
+
+  it("日成交量 Chart 返回空数据时保持未知且不抛错", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(new Response(JSON.stringify({ code: 200, data: { timestamp: [], num_data: [] } }), { status: 200 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await getCSQAQDailyVolume({ marketHashName: "Galil AR | Rocket Pop (Minimal Wear)", goodId: 1041, platform: "youpin", apiToken: "token-test" });
+    expect(result).toMatchObject({ volume: null, status: "unavailable", goodId: 1041 });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
     vi.unstubAllGlobals();
   });
 

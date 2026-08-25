@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { startTurnoverEnrichment, turnoverStatus } from "@/lib/turnover-enrichment";
+import { turnoverStatus } from "@/lib/turnover-enrichment";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -8,17 +8,10 @@ export async function GET() {
   return NextResponse.json(turnoverStatus(), { headers: { "Cache-Control": "no-store" } });
 }
 
-export async function POST(request: Request) {
-  try {
-    const body = await request.json().catch(() => ({})) as { items?: unknown };
-    const items = Array.isArray(body.items) ? body.items.slice(0, 50).flatMap((raw) => {
-      const value = raw as { marketHashName?: unknown; csqaqGoodId?: unknown };
-      const marketHashName = String(value.marketHashName ?? "").trim();
-      const csqaqGoodId = Number(value.csqaqGoodId);
-      return marketHashName && Number.isFinite(csqaqGoodId) && csqaqGoodId > 0 ? [{ marketHashName, csqaqGoodId }] : [];
-    }) : [];
-    return NextResponse.json(startTurnoverEnrichment(items), { headers: { "Cache-Control": "no-store" } });
-  } catch {
-    return NextResponse.json({ error: "日成交量补全请求无效" }, { status: 400 });
-  }
+/**
+ * 批量补全入口已停用：日成交量现在由扫描流程自动从 CSQAQ /info/chart 获取，
+ * 不再通过本端点触发历史累计成交量的批量拉取。
+ */
+export async function POST() {
+  return NextResponse.json({ status: "disabled", message: "批量补全已停用，日成交量随扫描自动填充" }, { status: 410 });
 }

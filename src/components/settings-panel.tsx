@@ -1,7 +1,7 @@
 "use client";
 
 import Link from "next/link";
-import { ArrowLeft, CheckCircle2, Save, Shield, XCircle } from "lucide-react";
+import { ArrowLeft, CheckCircle2, Key, Save, Shield, XCircle } from "lucide-react";
 import { useEffect, useState } from "react";
 import type { AppSettings } from "@/lib/types";
 
@@ -11,6 +11,10 @@ export default function SettingsPanel() {
   const [youpinAliases, setYoupinAliases] = useState("");
   const [message, setMessage] = useState("");
   const [saving, setSaving] = useState(false);
+  const [csfloatApiKey, setCsfloatApiKey] = useState("");
+  const [csqaqApiToken, setCsqaqApiToken] = useState("");
+  const [steamdtApiKey, setSteamdtApiKey] = useState("");
+  const [savingKeys, setSavingKeys] = useState(false);
 
   useEffect(() => {
     fetch("/api/settings", { cache: "no-store" }).then((response) => response.json()).then((value) => {
@@ -18,6 +22,11 @@ export default function SettingsPanel() {
       setBuffAliases(value.platformAliases.buff.join(", "));
       setYoupinAliases(value.platformAliases.youpin.join(", "));
     }).catch(() => setMessage("设置读取失败，请确认服务已正常启动。"));
+    fetch("/api/settings/keys", { cache: "no-store" }).then((r) => r.json()).then((value) => {
+      if (value.csqaqApiConfigured) setCsqaqApiToken("••••••••••••");
+      if (value.csfloatApiConfigured) setCsfloatApiKey("••••••••••••");
+      if (value.steamdtApiConfigured) setSteamdtApiKey("••••••••••••");
+    }).catch(() => undefined);
   }, []);
 
   function update<K extends keyof AppSettings>(key: K, value: AppSettings[K]) {
@@ -39,9 +48,36 @@ export default function SettingsPanel() {
     finally { setSaving(false); }
   }
 
+  async function saveKeys() {
+    setSavingKeys(true);
+    setMessage("");
+    const payload: Record<string, string> = {};
+    // Only send keys the user actually typed (skip the masked placeholder).
+    if (csfloatApiKey && csfloatApiKey !== "••••••••••••") payload.csfloatApiKey = csfloatApiKey;
+    if (csqaqApiToken && csqaqApiToken !== "••••••••••••") payload.csqaqApiToken = csqaqApiToken;
+    if (steamdtApiKey && steamdtApiKey !== "••••••••••••") payload.steamdtApiKey = steamdtApiKey;
+    if (!Object.keys(payload).length) { setMessage("请至少填写一个 API 密钥后再保存。"); setSavingKeys(false); return; }
+    try {
+      const response = await fetch("/api/settings/keys", { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(payload) });
+      const value = await response.json();
+      if (!response.ok) throw new Error(value.error || "密钥保存失败");
+      setMessage("API 密钥已写入 .env.local。重启服务后生效。");
+      setCsfloatApiKey("••••••••••••");
+      setCsqaqApiToken("••••••••••••");
+      setSteamdtApiKey("••••••••••••");
+    } catch (error) { setMessage(error instanceof Error ? error.message : "密钥保存失败"); }
+    finally { setSavingKeys(false); }
+  }
+
   return <main className="settings-shell">
     <header className="settings-header"><Link href="/"><ArrowLeft size={17} /> 返回扫描器</Link><div><h1>扫描器设置</h1><p>本地运行参数与平台适配规则</p></div></header>
     {!settings ? <div className="settings-loading">正在读取本地设置…</div> : <>
+      <section className="settings-section"><div className="section-heading"><span>00</span><div><h2>API 密钥</h2><p>填入平台密钥后写入 .env.local，重启服务即可生效。</p></div></div><div className="settings-grid">
+        <ApiKeyField label="CSFloat API Key" value={csfloatApiKey} onChange={setCsfloatApiKey} placeholder="输入 CSFloat API Key" />
+        <ApiKeyField label="CSQAQ API Token" value={csqaqApiToken} onChange={setCsqaqApiToken} placeholder="输入 CSQAQ API Token" />
+        <ApiKeyField label="SteamDT API Key" value={steamdtApiKey} onChange={setSteamdtApiKey} placeholder="输入 SteamDT API Key" />
+        <div className="settings-actions"><button className="secondary-button" onClick={() => void saveKeys()} disabled={savingKeys}><Save size={16} /> {savingKeys ? "保存中…" : "保存密钥"}</button><span className="hint">密钥不会回显到浏览器，保存后仅显示已配置状态</span></div>
+      </div></section>
       <section className="key-status-grid">
         <KeyStatus label="CSQAQ API Token" configured={settings.csqaqApiConfigured} />
         <KeyStatus label="SteamDT API Key" configured={settings.steamdtApiConfigured} />
@@ -67,11 +103,12 @@ export default function SettingsPanel() {
         <label><b>BUFF</b><input readOnly value="https://buff.163.com/goods/{goodsId}" /><small>goodsId 只取 SteamDT 的 BUFF 平台 itemId</small></label>
         <label><b>悠悠有品</b><input readOnly value="https://youpin898.com/market/goods-list?gameId=730&listType=10&templateId={templateId}" /><small>templateId 只取 SteamDT 的 YOUPIN 平台 itemId</small></label>
       </div></section>
-      <div className="settings-savebar"><div>{message || "配置仅保存在当前电脑。API Key 请在 .env.local 中修改。"}</div><button onClick={save} disabled={saving}><Save size={17} /> {saving ? "正在保存" : "保存设置"}</button></div>
+      <div className="settings-savebar"><div>{message || "配置仅保存在当前电脑。"}</div><button onClick={save} disabled={saving}><Save size={17} /> {saving ? "正在保存" : "保存设置"}</button></div>
     </>}
   </main>;
 }
 
 function KeyStatus({ label, configured }: { label: string; configured: boolean }) { return <div className={`key-card ${configured ? "configured" : "missing"}`}>{configured ? <CheckCircle2 size={20} /> : <XCircle size={20} />}<div><b>{label}</b><span>{configured ? "已配置" : "未配置"}</span></div></div>; }
+function ApiKeyField({ label, value, onChange, placeholder }: { label: string; value: string; onChange: (value: string) => void; placeholder: string }) { return <label><b>{label}</b><div className="api-key-input"><Key size={14} /><input type="text" value={value} onChange={(event) => onChange(event.target.value)} placeholder={placeholder} autoComplete="off" /></div></label>; }
 function SettingsNumber({ label, value, onChange, help, step = "1" }: { label: string; value: number; onChange: (value: number) => void; help?: string; step?: string }) { return <label><b>{label}</b><input type="number" min="0" step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />{help && <small>{help}</small>}</label>; }
 function splitAliases(value: string): string[] { return [...new Set(value.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean))]; }

@@ -106,25 +106,11 @@ async function runScanSession(request: ScanRequest, onProgress: (progress: ScanP
       } catch (error) { warnings.push(error instanceof Error ? error.message : "SteamDT 价格获取失败"); prices = new Map(); }
     }
   }
-  // Auto-fill daily volume from CSQAQ chart API for all unique items (non-blocking)
+  // Auto-fill daily volume from CSQAQ chart API for all unique items.
+  // Fire-and-forget so the scan never hangs waiting for 100+ chart requests.
   const csqaqToken = getServerSecret("CSQAQ_API_TOKEN");
   if (!settings.mockMode && csqaqToken) {
-    progress.status = "正在获取当日成交量";
-    onProgress({ ...progress });
-    const volumePromises = names.flatMap((name) => {
-      const metadata = getCsqaqItemMetadata(name);
-      const gid = metadata?.csqaqGoodId ?? null;
-      if (!gid || gid <= 0) return [];
-      return [("buff" as const), ("youpin" as const)].map((platform) =>
-        getCSQAQDailyVolume({ marketHashName: name, goodId: gid, platform, apiToken: csqaqToken, signal, sessionId: scanSessionId }).catch(() => null),
-      );
-    });
-    // Process in batches to avoid overwhelming the API
-    const batchSize = 5;
-    for (let i = 0; i < volumePromises.length; i += batchSize) {
-      if (signal?.aborted) break;
-      await Promise.allSettled(volumePromises.slice(i, i + batchSize));
-    }
+    void autoFillDailyVolumes(names, csqaqToken, signal, scanSessionId);
   }
   progress.matchedItems = [...prices.values()].filter((value) => value.length > 0).length;
   domestic.matched = progress.matchedItems;
@@ -279,4 +265,26 @@ function logImageDiagnostics(results: ScanResult[]): void {
   for (const result of distinctItems) console.info(`[图片诊断] ${result.marketHashName} → ${result.iconUrl || "暂无图片"}`);
   const uniqueImages = new Set(distinctItems.map((result) => result.iconUrl).filter(Boolean));
   if (distinctItems.length > 1 && uniqueImages.size <= 1) console.warn("[图片诊断] 多个不同饰品复用了同一个 imageUrl，请检查上游数据");
+}
+
+/**
+ * Fire-and-forget daily-volume fill for a set of market hash names. It runs in
+ * the background via the CSQAQ scheduler so a scan never blocks on 100+ chart
+ * requests. Results pop the daily_volume_cache; the UI picks them up on refresh.
+ */
+async function autoFillDailyVolumes(names: string[], apiToken: string, signal: AbortSignal | undefined, scanSessionId: string): Promise<void> {
+  const candidates = names.flatMap((name) => {
+    const gid = getCsqaqItemMetadata(name)?.csqaqGoodId ?? null;
+    if (!gid || gid <= 0) return [];
+    return [("buff" as const), ("youpin" as const)].map((platform) => ({ name, gid, platform }));
+  });
+  // Limit concurrency so the background queue drains at a healthy pace without
+  // hammering the CSQAQ API. The global scheduler already enforces a 1.1s gap.
+  const batchSize = 10;
+  for (let i = 0; i < candidates.length; i += batchSize) {
+    if (signal?.aborted) break;
+    await Promise.allSettled(candidates.slice(i, i + batchSize).map(({ name, gid, platform }) =>
+      getCSQAQDailyVolume({ marketHashName: name, goodId: gid, platform, apiToken, signal, sessionId: scanSessionId }).catch(() => null),
+    ));
+  }
 }
